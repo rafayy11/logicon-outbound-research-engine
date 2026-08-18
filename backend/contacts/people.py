@@ -59,6 +59,15 @@ def discover_decision_maker(
     titles = [dmt.title for dmt in campaign.decision_maker_titles]
     candidates = clay_search.find_decision_makers(company.canonical_domain, titles, max_results=10)
 
+    if candidates is None:
+        # Provider failure (rate limit, quota, network) -- distinct from a
+        # genuine empty search result. MANUAL_REVIEW keeps this eligible
+        # for retry on the next run rather than reporting a misleading
+        # "no candidates found" reason for a search that never completed.
+        company.status = CompanyStatus.MANUAL_REVIEW.value
+        session.commit()
+        return None, None
+
     company.status = CompanyStatus.DECISION_MAKER_PENDING.value
 
     if not candidates:

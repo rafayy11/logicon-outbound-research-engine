@@ -17,6 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -194,7 +195,7 @@ def _process_qualified_company(
     rejected: list[RejectedCompany],
     run_row: CampaignRun,
     research_run_id: str,
-    people_results: list,
+    people_results: Optional[list],
 ) -> None:
     """Coordinators -> tier -> (Tier A/B only) job openings + research ->
     decision maker -> employment -> email, for one company that already
@@ -218,6 +219,36 @@ def _process_qualified_company(
     enrich_job_openings_for_company), and Tier C (parked, never sequenced
     this run) also skips both -- it isn't going to be exported regardless."""
     stats.coordinator_candidates += 1
+
+    if people_results is None:
+        # Provider failure (rate limit, quota, network), not a genuine
+        # zero-result search -- must never be treated as "0 qualified
+        # coordinators found" (that would silently disqualify a company
+        # we never actually got an answer for). MANUAL_REVIEW leaves it
+        # eligible for retry on the next run instead of a permanent call.
+        session.add(
+            ProviderError(
+                run_id=run_row.id,
+                company_id=company.id,
+                operation="coordinator_search",
+                provider="clay",
+                error="Coordinator search failed (rate-limited or provider error) -- not counted as zero",
+                occurred_at=datetime.utcnow(),
+            )
+        )
+        company.status = CompanyStatus.MANUAL_REVIEW.value
+        session.commit()
+        rejected.append(
+            RejectedCompany(
+                company=company.company_name,
+                domain=company.canonical_domain,
+                source=None,
+                rejection_stage="coordinator_search",
+                rejection_reason="Coordinator search failed (provider error) -- will retry on next run, not disqualified",
+            )
+        )
+        return
+
     persist_coordinators(session, company, campaign, people_results)
     budget.record("coordinator_search", 1)
 
@@ -392,9 +423,18 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
             # one sequential call per company. Confirmed live this was
             # the dominant remaining per-company cost: ~12s/company,
             # ~4m52s for 24 companies processed one at a time.
-            people_results_by_company: dict[int, list] = {}
+            #
+            # max_workers=10 confirmed live to trigger sustained Clay
+            # rate-limiting: 86 of 263 companies (33%) in one run got a
+            # ClayError back. fetch_people_at_company distinguishes that
+            # (returns None) from a genuine zero-result search (returns
+            # []) specifically so this doesn't get silently counted as
+            # "0 coordinators found" and disqualified -- _process_qualified_company
+            # below routes a None to MANUAL_REVIEW for retry instead.
+            # Dropped to 5 workers to reduce how often this triggers at all.
+            people_results_by_company: dict[int, Optional[list]] = {}
             if passed:
-                with ThreadPoolExecutor(max_workers=10) as pool:
+                with ThreadPoolExecutor(max_workers=5) as pool:
                     futures = {
                         pool.submit(fetch_people_at_company, c, campaign, clay_search): c for c in passed
                     }
@@ -404,7 +444,7 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
                             people_results_by_company[c.id] = future.result()
                         except Exception as exc:
                             logger.warning("Coordinator search failed for %s: %s", c.company_name, exc)
-                            people_results_by_company[c.id] = []
+                            people_results_by_company[c.id] = None
 
             for company in passed:
                 try:

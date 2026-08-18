@@ -96,7 +96,16 @@ class ClaySearch:
 
     def find_people_at_company(
         self, domain: str, title_candidates: list[str], max_results: int = 25
-    ) -> list[ClayPersonResult]:
+    ) -> Optional[list[ClayPersonResult]]:
+        """Returns None on a provider failure (rate limit, quota exhausted,
+        network error) -- distinct from an empty list, which means the
+        search genuinely succeeded and found nobody. Conflating the two
+        used to silently turn a failed search into "0 qualified
+        coordinators" and disqualify the company outright -- confirmed
+        live: concurrent coordinator search across a batch triggered
+        sustained rate limiting, and ~33% of one run's candidates (86 of
+        263) got silently zeroed out this way instead of being flagged
+        for retry. Callers must check for None explicitly."""
         query = build_people_at_company_query(domain, title_candidates)
         people: list[ClayPersonResult] = []
         try:
@@ -104,13 +113,15 @@ class ClaySearch:
                 people.append(_parse_person(raw, domain))
         except ClayQuotaExhaustedError:
             logger.warning("Clay search quota exhausted while searching people at %s", domain)
+            return None
         except ClayError as exc:
             logger.warning("Clay search failed for %s: %s", domain, exc)
+            return None
         return people
 
     def find_decision_makers(
         self, domain: str, title_priority: list[str], max_results: int = 10
-    ) -> list[ClayPersonResult]:
+    ) -> Optional[list[ClayPersonResult]]:
         return self.find_people_at_company(domain, title_priority, max_results=max_results)
 
     def find_company_record(self, domain: str, prefer_name: Optional[str] = None) -> Optional[dict[str, Any]]:

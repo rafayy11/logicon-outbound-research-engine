@@ -166,6 +166,9 @@ def discover_and_classify_coordinators(
     persist_coordinators directly so the fetch half can run concurrently
     across a whole batch of companies."""
     people_results = fetch_people_at_company(company, campaign, clay_search)
+    if people_results is None:
+        return []  # provider failure -- caller (batch pipeline) handles this distinctly; this
+        # single-company convenience path just declines to fabricate a zero-coordinator answer
     return persist_coordinators(session, company, campaign, people_results)
 
 
