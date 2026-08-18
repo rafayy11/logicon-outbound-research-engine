@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/logs/*.log
+data/exports/*.csv
+data/manual_imports/*.csv
+data/manual_imports/*.xlsx
+.pytest_cache/
+*.egg-info/
