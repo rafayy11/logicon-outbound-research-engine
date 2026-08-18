@@ -104,9 +104,15 @@ def _is_export_eligible(rec: PipelineRecord) -> bool:
     )
 
 
-def personalization_gap_reason(rec: PipelineRecord, campaign: CampaignConfig) -> str | None:
-    """Why an otherwise fully-qualified record (Tier A/B, verified
-    decision maker, usable email) still won't appear in ready.csv.
+def is_ready(rec: PipelineRecord, campaign: CampaignConfig) -> bool:
+    """The single source of truth for "does this record actually belong
+    in ready.csv" -- used by build_ready_rows, personalization_gap_reason,
+    and the run's stop-condition (_current_ready_count in campaigns/
+    engine.py) so all three can never drift apart again. They did once:
+    the stop-check counted Tier A/B + verified + email as "ready" without
+    this coverage requirement, so a run reported "10 ready" and stopped
+    while only 6 records actually passed this function -- fixed by
+    routing the stop-check through the same coverage_field rule.
 
     Only coverage_field (metro_count) is required -- confirmed live that
     requiring volume_field (reporter_count) too was blocking every real
@@ -114,12 +120,19 @@ def personalization_gap_reason(rec: PipelineRecord, campaign: CampaignConfig) ->
     agencies simply don't publish a named reporter roster page; that's a
     real absence, not a research failure, and it shouldn't cost the
     prospect its export. volume_field is still surfaced as VOLUME_VAR
-    when Claygent finds it, just no longer required. None means it's
-    actually ready."""
+    when Claygent finds it, just no longer required."""
     if not _is_export_eligible(rec):
-        return None  # excluded for a different, already-logged reason
+        return False
     coverage = rec.research_map.get(campaign.coverage_field)
-    if coverage and coverage.value:
+    return bool(coverage and coverage.value)
+
+
+def personalization_gap_reason(rec: PipelineRecord, campaign: CampaignConfig) -> str | None:
+    """Why an otherwise fully-qualified record (Tier A/B, verified
+    decision maker, usable email) still won't appear in ready.csv. None
+    means either it's actually ready, or it's excluded for a different,
+    already-logged reason (not Tier A/B, no decision maker, etc.)."""
+    if not _is_export_eligible(rec) or is_ready(rec, campaign):
         return None
     return (
         f"Tier {rec.qualification.tier}, verified decision maker and email found, but "
@@ -133,17 +146,11 @@ def build_ready_rows(records: list[PipelineRecord], campaign: CampaignConfig) ->
     seen_domains: set[str] = set()
 
     for rec in records:
-        if not _is_export_eligible(rec):
+        if not is_ready(rec, campaign):
             continue
 
         volume = rec.research_map.get(campaign.volume_field)
         coverage = rec.research_map.get(campaign.coverage_field)
-        # Only coverage_field is mandatory -- per user direction, a real
-        # reporter roster page frequently doesn't exist, and that
-        # shouldn't hold back an otherwise fully-qualified prospect.
-        # volume_field is still included in the row below when known.
-        if not coverage or not coverage.value:
-            continue
 
         email = rec.decision_maker_status.email
         domain = rec.company.canonical_domain

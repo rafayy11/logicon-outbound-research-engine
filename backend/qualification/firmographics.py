@@ -99,8 +99,8 @@ def _store_job_openings_result(
         )
 
 
-def _enrich_job_openings_batch(
-    session: Session, companies: list[Company], campaign_key: str, clay_routines: ClayRoutines
+def enrich_job_openings_for_company(
+    session: Session, company: Company, campaign_key: str, clay_routines: ClayRoutines
 ) -> None:
     """Real job-board data (department + exact job titles), not an AI
     guess -- confirmed live to return structured results like
@@ -112,27 +112,25 @@ def _enrich_job_openings_batch(
     uses -- this is a second, more reliable signal source than Claygent's
     web-search-based hiring_signal field, not a replacement for it.
 
-    Batched across the whole passed-firmographic-filter set in one Clay
-    call instead of one call per company -- these companies have no
-    sequential dependency on each other."""
+    Deliberately NOT called from the firmographic filter stage: job
+    openings has zero influence on coordinator qualification or tiering
+    (that comes entirely from Clay's people search + rule-based title
+    classification in qualification/coordinator.py) -- it's purely
+    supplementary evidence for research.csv. Confirmed live: only ~11% of
+    firmographically-passed companies ever reach Tier A/B (83 passed, 9
+    researched in one real run), so calling this at the firmographic
+    stage was spending a Clay credit on job postings for companies that
+    were never going to be researched or contacted. Called instead
+    per-company, only once a company is confirmed Tier A/B, same gating
+    research already uses."""
     if not clay_routines.is_managed_function_available("job_openings"):
         return
-
-    pending: dict[str, Company] = {}
-    for company in companies:
-        idempotency_key = f"company:{company.id}:job_openings:{JOB_OPENINGS_PROMPT_VERSION}"
-        already = session.query(ResearchResultRow).filter(ResearchResultRow.idempotency_key == idempotency_key).one_or_none()
-        if already is None:
-            pending[str(company.id)] = company
-    if not pending:
+    idempotency_key = f"company:{company.id}:job_openings:{JOB_OPENINGS_PROMPT_VERSION}"
+    already = session.query(ResearchResultRow).filter(ResearchResultRow.idempotency_key == idempotency_key).one_or_none()
+    if already is not None:
         return
-
-    outcomes = clay_routines.enrich_field_batch(
-        "job_openings", {item_id: c.canonical_domain for item_id, c in pending.items()}
-    )
-    for item_id, company in pending.items():
-        outcome = outcomes.get(item_id) or RoutineOutcome(ok=False, error="no result returned for this item")
-        _store_job_openings_result(session, company, campaign_key, outcome)
+    outcome = clay_routines.enrich_field("job_openings", company.canonical_domain)
+    _store_job_openings_result(session, company, campaign_key, outcome)
     session.commit()
 
 
@@ -141,16 +139,17 @@ def filter_companies(
     companies: list[Company],
     clay_routines: ClayRoutines,
     run_id: int | None = None,
-    campaign_key: str | None = None,
 ) -> tuple[list[Company], list[RejectedCompany]]:
-    """Four passes instead of one big per-company loop, so the two Clay
-    calls (employee_count, job_openings) each become ONE batched call
-    covering the whole input batch instead of one sequential call per
-    company. Confirmed live: a 25-company batch's employee_count alone
-    took 5m40s at one call per company -- these companies have no
-    dependency on each other, only within-company step order matters
-    (can't check employee_count-based disqualifiers before employee_count
-    is known)."""
+    """Three passes instead of one big per-company loop, so the
+    employee_count Clay call becomes ONE batched call covering the whole
+    input batch instead of one sequential call per company. Confirmed
+    live: a 25-company batch's employee_count alone took 5m40s at one call
+    per company -- these companies have no dependency on each other, only
+    within-company step order matters (can't check employee_count-based
+    disqualifiers before employee_count is known).
+
+    job_openings enrichment is deliberately NOT here -- see
+    enrich_job_openings_for_company, called only for Tier A/B companies."""
     passed: list[Company] = []
     rejected: list[RejectedCompany] = []
     rejected_ids: set[int] = set()
@@ -229,13 +228,6 @@ def filter_companies(
             continue
         company.status = CompanyStatus.FIRMOGRAPHICALLY_FILTERED.value
         passed.append(company)
-
-    # Pass 4: batch job_openings for everyone who passed.
-    if campaign_key and passed:
-        try:
-            _enrich_job_openings_batch(session, passed, campaign_key, clay_routines)
-        except Exception as exc:  # optional enrichment -- never blocks qualification
-            logger.warning("job_openings batch enrichment failed: %s", exc)
 
     session.commit()
     logger.info(

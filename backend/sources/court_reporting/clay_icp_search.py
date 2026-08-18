@@ -30,6 +30,19 @@ Pagination note: confirmed live that Clay's query-mode search has no
 page_token in its response -- calling run_query_search again with the
 SAME search_id advances a server-side cursor (see client.py). This
 adapter relies on that via ClaySearch/ClayClient.iter_query_search.
+
+max_results was originally 150 -- confirmed live on 2026-08-19 that this
+query's real matching pool is 397 companies (has_more stayed True well
+past 150; paging to exhaustion returned exactly 397, has_more=False,
+exhaustion_reason=no_more_results). The 150 cap was silently discarding
+~63% of real ICP-matching supply. Raised to 500 for headroom. This is
+Clay's *search* quota (period_quota confirmed live: 1,000,000/year, ~4.7k
+used) -- a completely separate, much larger pool than whatever Clay's
+enrichment/routine credits cost, so pulling the full 397 here doesn't by
+itself spend enrichment credit; the pipeline's own firmographic filter +
+coordinator gating (see qualification/firmographics.py,
+campaigns/engine.py) is what keeps enrichment spend limited to companies
+that pass ICP checks, same as every other source.
 """
 
 from __future__ import annotations
@@ -75,7 +88,7 @@ def _parse_company(raw: dict[str, Any]) -> Optional[RawCompany]:
     )
 
 
-def collect(api_key: str, max_results: int = 150) -> list[RawCompany]:
+def collect(api_key: str, max_results: int = 500) -> list[RawCompany]:
     client = ClayClient(api_key=api_key)
     companies: list[RawCompany] = []
     seen_domains: set[str] = set()

@@ -25,6 +25,7 @@ from backend.credit.batching import BatchController, chunk
 from backend.credit.budget import CreditBudget
 from backend.exports.csv import (
     gather_pipeline_records,
+    is_ready,
     personalization_gap_reason,
     write_qa_sample_csv,
     write_ready_csv,
@@ -45,8 +46,12 @@ from backend.models.schemas import CampaignRunStats, CompanyStatus, RawCompany, 
 from backend.providers.clay.client import ClayClient
 from backend.providers.clay.routines import ClayRoutines
 from backend.providers.clay.search import ClaySearch
-from backend.qualification.coordinator import discover_and_classify_coordinators, qualified_coordinator_count
-from backend.qualification.firmographics import filter_companies
+from backend.qualification.coordinator import (
+    fetch_people_at_company,
+    persist_coordinators,
+    qualified_coordinator_count,
+)
+from backend.qualification.firmographics import enrich_job_openings_for_company, filter_companies
 from backend.qualification.prescreen import prescreen_batch
 from backend.qualification.tiers import qualify_and_tier
 from backend.contacts.employment import verify_employment
@@ -145,18 +150,34 @@ def _ensure_campaign_row(session: Session, campaign: CampaignConfig) -> Campaign
     return row
 
 
-def _current_ready_count(session: Session, campaign_key: str) -> int:
+def _current_ready_count(session: Session, campaign_key: str, coverage_field: str) -> int:
+    """Must mirror exports/csv.py's personalization_gap_reason() exactly,
+    or this undercounts remaining work: confirmed live, without the
+    coverage_field check this returned 10 (Tier A/B + verified + email
+    found) while only 6 of those 10 actually had a non-NONE coverage_field
+    value and could pass personalization_gap_reason at export time -- the
+    run stopped sourcing new batches 4 real prospects short of the
+    requested target because this didn't check the same gate the export
+    step does."""
     from backend.models.database import DecisionMakerStatusRecord
+    from backend.models.database import ResearchResult as ResearchResultRow
 
     return (
         session.query(Qualification)
         .join(DecisionMakerStatusRecord, DecisionMakerStatusRecord.company_id == Qualification.company_id)
+        .join(
+            ResearchResultRow,
+            (ResearchResultRow.company_id == Qualification.company_id)
+            & (ResearchResultRow.campaign_id == campaign_key)
+            & (ResearchResultRow.field_name == coverage_field),
+        )
         .filter(
             Qualification.campaign_id == campaign_key,
             Qualification.tier.in_(["A", "B"]),
             DecisionMakerStatusRecord.campaign_id == campaign_key,
             DecisionMakerStatusRecord.employment_verified == True,  # noqa: E712
             DecisionMakerStatusRecord.email_status == "FOUND",
+            ResearchResultRow.value.isnot(None),
         )
         .count()
     )
@@ -173,23 +194,31 @@ def _process_qualified_company(
     rejected: list[RejectedCompany],
     run_row: CampaignRun,
     research_run_id: str,
+    people_results: list,
 ) -> None:
-    """Coordinators -> tier -> (Tier A/B only) research -> decision maker
-    -> employment -> email, for one company that already passed the
-    firmographic filter. Raises on unexpected errors -- the caller wraps
-    this per company so one failure can't take down the whole run.
+    """Coordinators -> tier -> (Tier A/B only) job openings + research ->
+    decision maker -> employment -> email, for one company that already
+    passed the firmographic filter. Raises on unexpected errors -- the
+    caller wraps this per company so one failure can't take down the
+    whole run.
 
-    Coordinator discovery is a single deterministic Clay search call;
-    the 7-field research stage is 7 AI-powered Claygent calls per
-    company -- confirmed live to be the dominant cost in a real run
-    (88% of companies that got the full research treatment turned out
-    to have zero qualified coordinators and were disqualified anyway).
-    Coordinator discovery now runs FIRST so a company that was never
-    going to qualify is screened out before any research credit is
-    spent on it, and Tier C (parked, never sequenced this run) also
-    skips research -- it isn't going to be exported regardless."""
+    people_results is pre-fetched by the caller (fetch_people_at_company,
+    run concurrently across the whole batch) -- only the DB-writing half
+    (persist_coordinators) happens here, since SQLAlchemy sessions aren't
+    safe to write to from multiple threads.
+
+    The 7-field research stage is 7 AI-powered Claygent calls per
+    company (now one batched call) -- confirmed live to be the dominant
+    Clay-credit cost in a real run (88% of companies that got the full
+    research treatment turned out to have zero qualified coordinators
+    and were disqualified anyway). Coordinator discovery runs FIRST so a
+    company that was never going to qualify is screened out before any
+    research credit is spent on it; job_openings enrichment is deferred
+    to this same gate for the same reason (see
+    enrich_job_openings_for_company), and Tier C (parked, never sequenced
+    this run) also skips both -- it isn't going to be exported regardless."""
     stats.coordinator_candidates += 1
-    discover_and_classify_coordinators(session, company, campaign, clay_search)
+    persist_coordinators(session, company, campaign, people_results)
     budget.record("coordinator_search", 1)
 
     count = qualified_coordinator_count(session, company.id, campaign.key)
@@ -226,6 +255,12 @@ def _process_qualified_company(
             )
         )
         return  # Tier C stops here -- no research, no decision-maker/email spend
+
+    try:
+        enrich_job_openings_for_company(session, company, campaign.key, clay_routines)
+        budget.record("job_openings", 1)
+    except Exception as exc:  # optional evidence -- never blocks qualification
+        logger.warning("job_openings enrichment failed for %s: %s", company.company_name, exc)
 
     stats.research_candidates += 1
     research_company(session, company, campaign, clay_routines, run_row.id, research_run_id)
@@ -333,7 +368,7 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
     # -- 6-14: batched cheap-first pipeline -------------------------------
     if clay_client is not None:
         for batch in chunk(companies, batcher.batch_size):
-            ready_so_far = _current_ready_count(session, campaign.key)
+            ready_so_far = _current_ready_count(session, campaign.key, campaign.coverage_field)
             if not batcher.should_launch_next_batch(ready_so_far):
                 logger.info("Target reached (%d ready >= target %d) -- stopping further batches", ready_so_far, target)
                 break
@@ -346,16 +381,37 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
                 )
                 break
 
-            passed, batch_rejected = filter_companies(session, batch, clay_routines, run_row.id, campaign.key)
+            passed, batch_rejected = filter_companies(session, batch, clay_routines, run_row.id)
             rejected.extend(batch_rejected)
             stats.firmographic_pass += len(passed)
             budget.record("firmographic_enrichment", len(batch))
+
+            # Coordinator search is a Clay call per company with no
+            # cross-company dependency -- fetch the whole batch
+            # concurrently (pure network reads, no DB writes) instead of
+            # one sequential call per company. Confirmed live this was
+            # the dominant remaining per-company cost: ~12s/company,
+            # ~4m52s for 24 companies processed one at a time.
+            people_results_by_company: dict[int, list] = {}
+            if passed:
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    futures = {
+                        pool.submit(fetch_people_at_company, c, campaign, clay_search): c for c in passed
+                    }
+                    for future in as_completed(futures):
+                        c = futures[future]
+                        try:
+                            people_results_by_company[c.id] = future.result()
+                        except Exception as exc:
+                            logger.warning("Coordinator search failed for %s: %s", c.company_name, exc)
+                            people_results_by_company[c.id] = []
 
             for company in passed:
                 try:
                     _process_qualified_company(
                         session, company, campaign, clay_routines, clay_search,
                         budget, stats, rejected, run_row, research_run_id,
+                        people_results_by_company.get(company.id, []),
                     )
                 except Exception as exc:
                     # Defense in depth: every Clay call already has its own
@@ -383,11 +439,20 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
         stats.firmographic_pass = 0
 
     # -- 15: exports --------------------------------------------------------
-    records = gather_pipeline_records(session, campaign)
-    records.sort(key=lambda r: {"A": 0, "B": 1, "C": 2}.get(r.qualification.tier, 3))
-    records = batcher.trim_to_pool(records)
+    # all_records is the full cumulative history for this campaign (every
+    # tier, winners and losers) -- research.csv is meant to be that full
+    # master file. ready_records is the strict, trimmed subset that
+    # actually goes to Woodpecker. Trimming must happen AFTER filtering to
+    # is_ready(), not before: trimming the whole tier-sorted history to
+    # pool size first could cut off a genuinely ready Tier A/B record
+    # (missing only from the trimmed slice) while keeping an earlier
+    # same-tier record that isn't actually export-eligible -- confirmed
+    # live, this silently dropped 6 of 12 truly-ready prospects into
+    # nothing (not even rejected.csv) because gap-detection below only
+    # ran over the already-trimmed list too.
+    all_records = gather_pipeline_records(session, campaign)
 
-    for rec in records:
+    for rec in all_records:
         gap_reason = personalization_gap_reason(rec, campaign)
         if gap_reason:
             rejected.append(
@@ -422,6 +487,10 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
             )
         )
 
+    ready_records = [r for r in all_records if is_ready(r, campaign)]
+    ready_records.sort(key=lambda r: {"A": 0, "B": 1}.get(r.qualification.tier, 2))
+    ready_records = batcher.trim_to_pool(ready_records)
+
     today = datetime.utcnow().strftime("%Y-%m-%d")
     export_dir = Path("data/exports")
     ready_path = export_dir / f"{campaign.key}_{today}_ready.csv"
@@ -429,9 +498,9 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
     qa_path = export_dir / f"{campaign.key}_{today}_qa_sample.csv"
     rejected_path = export_dir / f"{campaign.key}_{today}_rejected.csv"
 
-    stats.final_exported = write_ready_csv(records, campaign, ready_path)
-    write_research_csv(records, campaign, research_path)
-    write_qa_sample_csv(records, campaign, qa_path)
+    stats.final_exported = write_ready_csv(ready_records, campaign, ready_path)
+    write_research_csv(all_records, campaign, research_path)
+    write_qa_sample_csv(ready_records, campaign, qa_path)
     write_rejected_csv(rejected, rejected_path)
 
     # -- finalize run row / stats -----------------------------------------

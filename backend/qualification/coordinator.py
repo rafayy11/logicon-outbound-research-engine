@@ -93,16 +93,32 @@ def classify_title(raw_title: str | None) -> tuple[CoordinatorClassificationLabe
     )
 
 
-def discover_and_classify_coordinators(
-    session: Session,
-    company,
-    campaign: CampaignConfig,
-    clay_search: ClaySearch,
-) -> list[Person]:
-    people_results = clay_search.find_people_at_company(
+def fetch_people_at_company(company, campaign: CampaignConfig, clay_search: ClaySearch):
+    """Pure network read (Clay's search-mode API), no DB writes -- split
+    out from discover_and_classify_coordinators specifically so the fetch
+    can run concurrently across many companies (via a thread pool) while
+    the DB-writing half stays sequential in the main thread. SQLAlchemy
+    sessions aren't safe to write to from multiple threads; the Clay
+    search call itself has no such restriction. Confirmed live this was
+    the dominant remaining per-company sequential cost after firmographic
+    and research batching: ~12s/company, ~4m52s for 24 companies run one
+    at a time."""
+    return clay_search.find_people_at_company(
         company.canonical_domain, campaign.coordinator_title_candidates, max_results=25
     )
 
+
+def persist_coordinators(
+    session: Session,
+    company,
+    campaign: CampaignConfig,
+    people_results,
+) -> list[Person]:
+    """DB-writing half of discover_and_classify_coordinators -- takes
+    already-fetched Clay search results (see fetch_people_at_company) and
+    persists Person/CoordinatorClassification rows. Runs classification
+    via the deterministic rule-based classify_title(), never an extra
+    Clay/LLM call."""
     people: list[Person] = []
     for pr in people_results:
         person = Person(
@@ -137,6 +153,20 @@ def discover_and_classify_coordinators(
     company.status = CompanyStatus.COORDINATORS_FOUND.value
     session.commit()
     return people
+
+
+def discover_and_classify_coordinators(
+    session: Session,
+    company,
+    campaign: CampaignConfig,
+    clay_search: ClaySearch,
+) -> list[Person]:
+    """Single-company convenience wrapper (fetch + persist). Batch
+    processing in campaigns/engine.py calls fetch_people_at_company and
+    persist_coordinators directly so the fetch half can run concurrently
+    across a whole batch of companies."""
+    people_results = fetch_people_at_company(company, campaign, clay_search)
+    return persist_coordinators(session, company, campaign, people_results)
 
 
 def qualified_coordinator_count(session: Session, company_id: int, campaign_id: str) -> int:
