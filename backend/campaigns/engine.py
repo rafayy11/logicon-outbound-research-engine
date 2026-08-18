@@ -220,42 +220,61 @@ def _process_qualified_company(
     this run) also skips both -- it isn't going to be exported regardless."""
     stats.coordinator_candidates += 1
 
-    if people_results is None:
-        # Provider failure (rate limit, quota, network), not a genuine
-        # zero-result search -- must never be treated as "0 qualified
-        # coordinators found" (that would silently disqualify a company
-        # we never actually got an answer for). MANUAL_REVIEW leaves it
-        # eligible for retry on the next run instead of a permanent call.
-        session.add(
-            ProviderError(
-                run_id=run_row.id,
-                company_id=company.id,
-                operation="coordinator_search",
-                provider="clay",
-                error="Coordinator search failed (rate-limited or provider error) -- not counted as zero",
-                occurred_at=datetime.utcnow(),
-            )
-        )
-        company.status = CompanyStatus.MANUAL_REVIEW.value
-        session.commit()
-        rejected.append(
-            RejectedCompany(
-                company=company.company_name,
-                domain=company.canonical_domain,
-                source=None,
-                rejection_stage="coordinator_search",
-                rejection_reason="Coordinator search failed (provider error) -- will retry on next run, not disqualified",
-            )
-        )
-        return
+    existing_qualification = (
+        session.query(Qualification)
+        .filter(Qualification.company_id == company.id, Qualification.campaign_id == campaign.key)
+        .one_or_none()
+    )
 
-    persist_coordinators(session, company, campaign, people_results)
-    budget.record("coordinator_search", 1)
+    if existing_qualification is not None:
+        # Already coordinator-searched and tiered in a prior run --
+        # reusing this avoids both a wasted Clay credit and duplicate
+        # Person/CoordinatorClassification rows for the same real people
+        # (persist_coordinators has no idempotency key, unlike every
+        # other Clay-touching stage in this pipeline -- confirmed live:
+        # CompanyStatus.EXPORTED is defined but never actually set
+        # anywhere, so nothing ever marked a qualified company "done" and
+        # every re-run was re-searching and re-spending on it).
+        qualification = existing_qualification
+        if qualification.coordinator_count > 0:
+            stats.coordinator_qualified += 1
+    else:
+        if people_results is None:
+            # Provider failure (rate limit, quota, network), not a genuine
+            # zero-result search -- must never be treated as "0 qualified
+            # coordinators found" (that would silently disqualify a company
+            # we never actually got an answer for). MANUAL_REVIEW leaves it
+            # eligible for retry on the next run instead of a permanent call.
+            session.add(
+                ProviderError(
+                    run_id=run_row.id,
+                    company_id=company.id,
+                    operation="coordinator_search",
+                    provider="clay",
+                    error="Coordinator search failed (rate-limited or provider error) -- not counted as zero",
+                    occurred_at=datetime.utcnow(),
+                )
+            )
+            company.status = CompanyStatus.MANUAL_REVIEW.value
+            session.commit()
+            rejected.append(
+                RejectedCompany(
+                    company=company.company_name,
+                    domain=company.canonical_domain,
+                    source=None,
+                    rejection_stage="coordinator_search",
+                    rejection_reason="Coordinator search failed (provider error) -- will retry on next run, not disqualified",
+                )
+            )
+            return
 
-    count = qualified_coordinator_count(session, company.id, campaign.key)
-    if count > 0:
-        stats.coordinator_qualified += 1
-    qualification = qualify_and_tier(session, company, campaign.key, count)
+        persist_coordinators(session, company, campaign, people_results)
+        budget.record("coordinator_search", 1)
+
+        count = qualified_coordinator_count(session, company.id, campaign.key)
+        if count > 0:
+            stats.coordinator_qualified += 1
+        qualification = qualify_and_tier(session, company, campaign.key, count)
 
     if qualification.tier == "A":
         stats.tier_a += 1
@@ -432,11 +451,27 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
             # "0 coordinators found" and disqualified -- _process_qualified_company
             # below routes a None to MANUAL_REVIEW for retry instead.
             # Dropped to 5 workers to reduce how often this triggers at all.
+            #
+            # Companies that already have a Qualification row for this
+            # campaign were already coordinator-searched in a prior run --
+            # _process_qualified_company reuses that result, so fetching
+            # again here would be a wasted Clay credit before that reuse
+            # check even runs.
+            already_qualified_ids = {
+                q.company_id
+                for q in session.query(Qualification.company_id).filter(
+                    Qualification.campaign_id == campaign.key,
+                    Qualification.company_id.in_([c.id for c in passed]),
+                )
+            }
+            needs_coordinator_search = [c for c in passed if c.id not in already_qualified_ids]
+
             people_results_by_company: dict[int, Optional[list]] = {}
-            if passed:
+            if needs_coordinator_search:
                 with ThreadPoolExecutor(max_workers=5) as pool:
                     futures = {
-                        pool.submit(fetch_people_at_company, c, campaign, clay_search): c for c in passed
+                        pool.submit(fetch_people_at_company, c, campaign, clay_search): c
+                        for c in needs_coordinator_search
                     }
                     for future in as_completed(futures):
                         c = futures[future]

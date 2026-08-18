@@ -28,6 +28,15 @@ def find_work_email(
         .one_or_none()
     )
 
+    if status is not None and status.email_status == EmailStatus.FOUND.value and status.email:
+        # Already have a definitive answer from a prior run -- calling
+        # Clay again would just re-spend a work_email credit to re-learn
+        # the same email. MISSING is intentionally NOT treated this way:
+        # unlike FOUND, it doesn't yet distinguish "Clay looked and there
+        # really is no email" from a transient provider failure, so it
+        # stays retryable.
+        return status.email, status.email_status
+
     if not person.current_company_domain:
         if status:
             status.email_status = EmailStatus.MISSING.value
