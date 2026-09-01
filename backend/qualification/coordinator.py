@@ -52,6 +52,18 @@ _STRONG_QUALIFYING_PATTERNS = [
     r"\boperations coordinator\b",
     r"\bclaims coordinator\b",
     r"\bnetwork coordinator\b",
+    # Added 2026-08-19 after finding 76 real people sitting in REVIEW
+    # (classified but never actually reviewed, so never counted toward
+    # any tier) -- these are industry-specific operational coordination
+    # titles at court reporting/litigation-support agencies, same
+    # function as "scheduling coordinator" under a different noun:
+    r"\bcase coordinator\b",         # coordinates deposition/case logistics
+    r"\bdeposition coordinator\b",   # the single most industry-specific title in the whole set
+    r"\bcalendar coordinator\b",     # literally scheduling -- confirmed directly against a real agency's site
+    r"\btranscript coordinator\b",   # coordinates the core deliverable's production/turnaround
+    r"\bproduction coordinator\b",   # coordinates service delivery (depos, video)
+    r"\bclient services coordinator\b",  # client-facing scheduling/service coordination
+    r"\boffice coordinator\b",       # small-agency equivalent of a scheduling role
 ]
 
 _BARE_COORDINATOR_PATTERN = re.compile(r"\bcoordinator\b", re.IGNORECASE)
@@ -118,9 +130,28 @@ def persist_coordinators(
     already-fetched Clay search results (see fetch_people_at_company) and
     persists Person/CoordinatorClassification rows. Runs classification
     via the deterministic rule-based classify_title(), never an extra
-    Clay/LLM call."""
+    Clay/LLM call.
+
+    Idempotent per (company_id, first_name, last_name, raw_title):
+    confirmed live this had no such check at all -- any company whose
+    coordinator search ran more than once (overlapping runs before the
+    Qualification-reuse check existed) got the exact same real person
+    inserted as a second, third, even Nth Person/CoordinatorClassification
+    row, and qualified_coordinator_count() below just counts rows, not
+    distinct people. This silently inflated tiers: 24 of 34 affected
+    companies' real tier was different once deduplicated (5 Tier A
+    companies were really Tier C). See scripts/dedupe_coordinators.py
+    for the one-off cleanup of data already corrupted before this fix."""
+    existing_identities = {
+        (p.first_name, p.last_name, p.raw_title)
+        for p in session.query(Person).filter(Person.company_id == company.id).all()
+    }
     people: list[Person] = []
     for pr in people_results:
+        identity = (pr.first_name, pr.last_name, pr.raw_title)
+        if identity in existing_identities:
+            continue
+        existing_identities.add(identity)
         person = Person(
             company_id=company.id,
             first_name=pr.first_name,

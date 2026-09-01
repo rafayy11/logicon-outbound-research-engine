@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 READY_COLUMNS = [
     "FIRST_NAME", "LAST_NAME", "EMAIL", "COMPANY", "DOMAIN", "ROLE_TITLE",
     "TIER", "ROLE_COUNT", "VOLUME_VAR", "COVERAGE_VAR", "SIGNAL_PHRASE",
-    "CITY", "STATE", "LINKEDIN_URL", "EMPLOYEE_COUNT", "INDUSTRY",
+    "CITY", "STATE", "LINKEDIN_URL", "COMPANY_LINKEDIN_URL", "EMPLOYEE_COUNT", "INDUSTRY",
     "QUALIFICATION_REASON", "CAMPAIGN",
 ]
 
@@ -94,8 +94,13 @@ def gather_pipeline_records(session: Session, campaign: CampaignConfig) -> list[
 
 
 def _is_export_eligible(rec: PipelineRecord) -> bool:
+    # Per explicit direction: Tier C (1-2 qualified coordinators) now
+    # counts too, not just A/B (3+) -- there are only 7 real Tier A/B
+    # companies total, so restricting to those alone leaves the much
+    # larger Tier C pool (41 companies, each with a real confirmed
+    # coordinator) completely unused.
     return bool(
-        rec.qualification.tier in ("A", "B")
+        rec.qualification.tier in ("A", "B", "C")
         and rec.decision_maker is not None
         and rec.decision_maker_status is not None
         and rec.decision_maker_status.employment_verified
@@ -175,6 +180,7 @@ def build_ready_rows(records: list[PipelineRecord], campaign: CampaignConfig) ->
                 "CITY": rec.company.city or "",
                 "STATE": rec.company.state or "",
                 "LINKEDIN_URL": rec.decision_maker.linkedin_url or "",
+                "COMPANY_LINKEDIN_URL": rec.company.linkedin_url or "",
                 "EMPLOYEE_COUNT": rec.company.employee_count or "",
                 "INDUSTRY": rec.company.industry or "",
                 "QUALIFICATION_REASON": rec.qualification.qualification_reason or "",

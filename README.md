@@ -1,15 +1,73 @@
 # Logicon Outbound Research Engine
 
-Turns the Logicon Outbound Playbook into a repeatable pipeline: vertical
-source directories -> raw companies -> normalize/dedupe -> Clay
-enrichment/research -> Logicon ICP + coordinator qualification -> tiering
--> decision maker -> work email -> campaign-ready CSVs for manual
-Woodpecker upload. Not an email sender, not a Clay replacement -- this
-app owns the business rules, Clay owns research/enrichment.
+An automated lead-research pipeline for B2B cold outreach. Point it at
+an industry, and it produces a spreadsheet of real companies, the one
+person at each company who actually owns the relevant workflow (not
+just any employee), a verified work email for them, and the specific
+fact about that company used to justify why they're worth contacting.
+It is not a scraper and not a mass-emailer -- it's the judgment layer
+that decides *who* to contact and *why*, sitting between raw company
+lists and a cold-email tool (Woodpecker, Instantly, etc.).
 
-Built first: **court_reporting**, end to end. `process_serving` and
-`ia_ime` get added as new config files once court_reporting is proven on
-real data -- the engine itself never changes per vertical.
+**What makes it different from a generic scraper:** every company that
+gets excluded is excluded with a stated, inspectable reason -- wrong
+industry, too small, a subsidiary of an already-contacted parent
+company, no one in a qualifying role. Nothing is guessed. A missing
+fact (an email, a headcount, a metro count) stays blank with a reason
+rather than being interpolated or faked, and every dollar of paid
+enrichment is spent on companies already shown likely to qualify, never
+on the raw, unfiltered pool.
+
+Built and proven end-to-end on one vertical: **court reporting
+agencies**. The engine itself is fully generic -- industry-specific
+logic (job-title patterns, disqualifiers, research questions) lives in
+one config file per vertical (`backend/campaigns/configs/`), so a new
+industry is a new config file, not a rewrite. `process_serving` and
+`ia_ime` are wired into the config registry and ready to receive their
+own config, intentionally not built out yet -- the plan was to prove
+one vertical fully on real data before replicating the pattern.
+
+## Requirements
+
+- Python 3.10+
+- A [Clay](https://clay.com) workspace with API access (Clay does the
+  actual data enrichment; this app owns the business logic and never
+  replaces it) -- a free/trial workspace is enough to try it
+- Optional: a Google Maps Platform API key, to add Google Places as an
+  extra source (the pipeline runs fully without it)
+
+## How it works
+
+Seven stages, split deliberately into a free/local qualification phase
+and a paid enrichment phase, so a limited API budget is always spent on
+the companies already shown likeliest to qualify -- never on the whole
+raw pool:
+
+1. **Source** -- pull raw companies from however many collectors are
+   configured for the vertical (directories, Clay's own search
+   database, Google Places, manual CSV/Excel imports).
+2. **Dedupe** -- collapse the same company seen from multiple sources
+   into one record, by domain first, name+location as a fallback.
+   Dedup state persists across runs, so re-running a source never
+   reprocesses a company it already has.
+3. **Qualify** -- firmographic and text-based disqualifiers (company
+   size, industry, roll-up/subsidiary detection) run for free, before
+   anything paid.
+4. **Coordinator search** -- find staff whose title matches the
+   vertical's qualifying role (e.g. "scheduling coordinator" for court
+   reporting), still free, and use the result to assign a tier
+   (A/B/C).
+5. **Research** -- *only* for Tier A/B companies, paid per-field Clay
+   calls answer the vertical's specific research questions (e.g. how
+   many metro areas a company covers).
+6. **Decision-maker + email** -- find the actual person, verify they
+   currently work there, look up a real work email. Every step is
+   idempotent, so re-running a batch never re-pays for a person already
+   resolved.
+7. **Suppress + export** -- check a do-not-contact list, then write out
+   four CSVs: ready-to-send, full research trail, rejected-with-reasons,
+   and a random QA sample for a human spot-check before anything goes
+   out.
 
 ## Setup
 
@@ -49,6 +107,15 @@ list functions -- routine ids come from Clay's UI, not from this script.
    (`CLAY_ROUTINE_WORK_EMAIL`, `CLAY_ROUTINE_EMPLOYEE_COUNT`, ...). Any left
    blank are reported as unavailable, never guessed.
 
+**Multiple Clay accounts (optional):** functions are per-workspace, so
+switching Clay accounts means switching both the API key and every
+routine id at once. `CLAY_ACTIVE_ACCOUNT` picks which complete set is
+used -- unset (or `primary`) reads the bare `CLAY_*` vars above; any
+other name reads `CLAY_ACCOUNT_{NAME}_*` instead (see
+`.env.example` and `backend/providers/clay/accounts.py`). This is how
+the pipeline adds capacity from a second workspace, or fails over when
+one account's plan limits are hit, without any code change.
+
 Then validate:
 
 ```bash
@@ -86,9 +153,10 @@ run_campaign.py
 backend/
   campaigns/            # engine.py (the one pipeline) + configs/*.py (per-vertical data)
   sources/               # company-only collectors, no qualification logic
-    court_reporting/ncra.py, state_associations.py
+    court_reporting/ncra.py, state_associations.py, clay_icp_search.py, ...
     google_places.py     # optional, skipped cleanly with no GOOGLE_MAPS_API_KEY
   providers/clay/         # ALL Clay-specific code; everything else uses normalized models
+    accounts.py           # multi-account support -- swap API key + routine ids with one env var
   research/               # Claygent-style one-fact-per-call research + evidence + signal detection
   qualification/          # firmographics, coordinator classification, tiering, disqualifiers
   contacts/                # decision-maker discovery, employment verification, work email
@@ -100,7 +168,11 @@ data/
   manual_imports/          # CSV fallback for sources without a live adapter yet
   exports/, logs/
   suppressions.csv
-scripts/validate_clay.py, validate_google_places.py
+scripts/
+  validate_clay.py, validate_google_places.py   # one-time Clay/Google setup checks
+  export_all.py                                  # per-tier + full-database CSV exports
+  source_report.py                               # collection counts by source
+  build_court_reporting_master.py                # merges pipeline output with manually-researched contacts
 ```
 
 ## Sources -- current state (court_reporting)
@@ -162,6 +234,48 @@ scripts/validate_clay.py, validate_google_places.py
 ./.venv/bin/python3 -m pytest tests/ -v
 ```
 
-Covers normalization, dedup (within and across runs/sources), suppression,
-disqualifiers, coordinator classification, and tiering -- all pure-logic,
-no network/Clay required.
+94 tests, all pure-logic (no network/Clay calls, so they run the same on
+any machine). Covers normalization, dedup (within and across
+runs/sources), suppression, disqualifiers, coordinator classification,
+tiering, and every idempotency guarantee described below.
+
+## Engineering notes: real production bugs found and fixed
+
+This system's real ICP was proven strict by running it against live
+data repeatedly and treating every unexpectedly-low result as a bug to
+disprove, not a number to accept. A few of the fixes that came out of
+that, since they're a better signal of engineering process than any
+description of the architecture:
+
+- **Duplicate-coordinator inflation.** Coordinator search had no
+  idempotency check, so re-processing a company could insert the same
+  real person as a second/third row -- inflating that company's
+  coordinator count and, downstream, its tier. Found by querying real
+  results, not by inspection; fixed with an identity check before
+  insert, and 550 pre-existing duplicate rows were cleaned
+  retroactively, correcting the tier on 22 companies.
+- **Silent-zero on rate limiting.** A failed Clay search (rate limit,
+  network error) and a search that genuinely found nobody both used to
+  produce the same result: zero qualified coordinators, and the company
+  got disqualified. Confirmed live that concurrent search during a
+  batch run triggered sustained rate limiting, silently zeroing out
+  ~33% of one run's candidates. Fixed by treating "search failed" and
+  "search succeeded with no results" as distinct outcomes -- only the
+  second is a real disqualification.
+- **Under-counting from a narrow title classifier.** 76 real people
+  with legitimate industry-specific titles ("Deposition Coordinator,"
+  "Calendar Coordinator") were being classified as ambiguous and never
+  counted toward any company's tier. Found by direct inspection of
+  people sitting in review status; fixed by widening the classifier's
+  pattern list against real observed titles.
+- **Roll-up subsidiaries slipping through.** A company's own
+  description text (e.g. "Orange Legal, a Veritext Company") is real
+  evidence it's a subsidiary of an already-known parent, not an
+  independent target -- but the field carrying that text was defined in
+  the schema and never actually populated by any source. Fixed by
+  wiring the field through, plus a name-pattern fallback for companies
+  already collected before the fix.
+
+The common thread: every fix came from noticing a number was
+implausibly low and tracing it to a real defect, never from assuming
+the ICP was just strict.

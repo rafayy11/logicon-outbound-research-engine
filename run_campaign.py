@@ -63,6 +63,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Logicon Outbound Research Engine")
     parser.add_argument("--campaign", required=True, help=f"One of: {', '.join(available_campaigns())}")
     parser.add_argument("--target", type=int, default=50, help="Target number of FINAL campaign-ready prospects")
+    parser.add_argument(
+        "--stage", default="full", choices=["qualify", "enrich", "full"],
+        help=(
+            "qualify: coordinator search + tiering only, spends nothing from the "
+            "scarce enrichment-credit pool. enrich: job openings/research/decision-"
+            "maker/email for companies already at Tier A/B -- run this deliberately "
+            "once you've reviewed the qualify-stage results. full: both in one pass "
+            "(default, original behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--enrich-tiers", default="A,B",
+        help="Comma-separated tiers --stage enrich spends real credit on, e.g. A,B,C. Default A,B (Tier C stays parked, no spend).",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -79,7 +93,8 @@ def main() -> int:
         print(f"Error: {exc}")
         return 1
 
-    stats = run_pipeline(campaign, args.target)
+    enrich_tiers = tuple(t.strip().upper() for t in args.enrich_tiers.split(",") if t.strip())
+    stats = run_pipeline(campaign, args.target, stage=args.stage, enrich_tiers=enrich_tiers)
     _print_report(stats)
     return 0
 

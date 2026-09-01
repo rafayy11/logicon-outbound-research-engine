@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from backend.providers.clay.accounts import active_account
 from backend.providers.clay.client import ClayAPIError, ClayClient, ClayError
 
 logger = logging.getLogger(__name__)
@@ -145,30 +146,34 @@ def _run_sync_autocorrect(
     don't need to build a one-element list themselves."""
     return _run_batch_sync_autocorrect(client, routine_id, [{"id": item_id, "inputs": inputs}])
 
-# Clay-managed function routine ids, read from env. Missing = unavailable,
-# never guessed.
+# Clay-managed function routine ids, read from env (account-scoped --
+# see accounts.py). Suffixes here are relative to the account's own
+# prefix ("CLAY_" for primary, "CLAY_ACCOUNT_{NAME}_" otherwise), not
+# full env var names. Missing = unavailable, never guessed.
 MANAGED_ROUTINES = {
-    "work_email": "CLAY_ROUTINE_WORK_EMAIL",
-    "employee_count": "CLAY_ROUTINE_EMPLOYEE_COUNT",
-    "revenue": "CLAY_ROUTINE_REVENUE",
-    "techstack": "CLAY_ROUTINE_TECHSTACK",
-    "job_openings": "CLAY_ROUTINE_JOB_OPENINGS",
-    "company_news": "CLAY_ROUTINE_COMPANY_NEWS",
+    "work_email": "ROUTINE_WORK_EMAIL",
+    "employee_count": "ROUTINE_EMPLOYEE_COUNT",
+    "revenue": "ROUTINE_REVENUE",
+    "techstack": "ROUTINE_TECHSTACK",
+    "job_openings": "ROUTINE_JOB_OPENINGS",
+    "company_news": "ROUTINE_COMPANY_NEWS",
+    "linkedin_lookup": "ROUTINE_LINKEDIN_LOOKUP",
 }
 
-GENERIC_RESEARCH_ROUTINE_ENV = "CLAY_ROUTINE_RESEARCH_GENERIC"
-PER_FIELD_RESEARCH_ROUTINE_PREFIX = "CLAY_ROUTINE_RESEARCH_"
+GENERIC_RESEARCH_ROUTINE_SUFFIX = "ROUTINE_RESEARCH_GENERIC"
+PER_FIELD_RESEARCH_ROUTINE_PREFIX = "ROUTINE_RESEARCH_"
 
 
-def configured_routine_ids() -> dict[str, Optional[str]]:
-    ids = {name: os.environ.get(env_var) or None for name, env_var in MANAGED_ROUTINES.items()}
-    ids["research_generic"] = os.environ.get(GENERIC_RESEARCH_ROUTINE_ENV) or None
+def configured_routine_ids(account=None) -> dict[str, Optional[str]]:
+    account = account or active_account()
+    ids = {name: account.env(suffix) for name, suffix in MANAGED_ROUTINES.items()}
+    ids["research_generic"] = account.env(GENERIC_RESEARCH_ROUTINE_SUFFIX)
     return ids
 
 
-def per_field_research_routine_id(field_name: str) -> Optional[str]:
-    env_var = f"{PER_FIELD_RESEARCH_ROUTINE_PREFIX}{field_name.upper()}"
-    return os.environ.get(env_var) or None
+def per_field_research_routine_id(field_name: str, account=None) -> Optional[str]:
+    account = account or active_account()
+    return account.env(f"{PER_FIELD_RESEARCH_ROUTINE_PREFIX}{field_name.upper()}")
 
 
 @dataclass
@@ -384,9 +389,9 @@ def _call_and_extract_batch(
 
 
 class ClayRoutines:
-    def __init__(self, client: ClayClient):
+    def __init__(self, client: ClayClient, account=None):
         self.client = client
-        self.routine_ids = configured_routine_ids()
+        self.routine_ids = configured_routine_ids(account=account)
 
     # -- firmographic / managed-function enrichment ----------------------
 
@@ -438,8 +443,15 @@ class ClayRoutines:
             "last_name": last_name,
             "full_name": full_name,
             "full name": full_name,
+            "Full Name": full_name,
             "name": full_name,
             "domain": domain,
+            # Confirmed live 2026-08-21: account 3's Find Work Email
+            # function requires "company domain" as its own distinct
+            # field, separate from "domain" -- the earlier account's
+            # function apparently accepted "domain" alone, this one didn't.
+            "company_domain": domain,
+            "Company Domain": domain,
         }
         if company_name:
             inputs["company_name"] = company_name
@@ -450,6 +462,41 @@ class ClayRoutines:
             inputs["linkedin_url"] = company_social_url
         return _call_and_extract(
             self.client, routine_id, item_id, inputs, preferred_keys=["work email", "email"]
+        )
+
+    def find_person_linkedin_url(
+        self,
+        full_name: str,
+        work_email: Optional[str],
+        company_name: Optional[str],
+        company_domain: str,
+        item_id: str = "row-1",
+    ) -> RoutineOutcome:
+        """Account-3 function (2026-08-20): inputs are full name, work
+        email, company name, company domain. Sends plausible spellings
+        of each up front, same reasoning as find_work_email -- item-level
+        "missing input" failures happen after the submit-time 400
+        auto-correct already ran, so there's no retry opportunity."""
+        routine_id = self.routine_ids.get("linkedin_lookup")
+        if not routine_id:
+            return RoutineOutcome(ok=False, error="linkedin_lookup routine not configured")
+        inputs = {
+            "full_name": full_name,
+            "full name": full_name,
+            "name": full_name,
+            "domain": company_domain,
+            "company_domain": company_domain,
+            "Company Domain": company_domain,
+        }
+        if work_email:
+            inputs["work_email"] = work_email
+            inputs["Work Email"] = work_email
+            inputs["email"] = work_email
+        if company_name:
+            inputs["company_name"] = company_name
+            inputs["Company Name"] = company_name
+        return _call_and_extract(
+            self.client, routine_id, item_id, inputs, preferred_keys=["linkedin url", "linkedin_url", "linkedin"]
         )
 
     # -- Claygent-style deterministic research ---------------------------

@@ -18,7 +18,7 @@ from backend.models.database import ResearchResult as ResearchResultRow
 from backend.models.schemas import CompanyStatus, RejectedCompany
 from backend.providers.clay.routines import ClayRoutines, RoutineOutcome
 from backend.qualification.coordinator import classify_title
-from backend.qualification.disqualifiers import check_hard_firmographic, check_text_based_disqualifiers
+from backend.qualification.disqualifiers import check_hard_firmographic, check_rollup_subsidiary_name, check_text_based_disqualifiers
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ def filter_companies(
     companies: list[Company],
     clay_routines: ClayRoutines,
     run_id: int | None = None,
+    campaign_key: str | None = None,
 ) -> tuple[list[Company], list[RejectedCompany]]:
     """Three passes instead of one big per-company loop, so the
     employee_count Clay call becomes ONE batched call covering the whole
@@ -148,11 +149,39 @@ def filter_companies(
     within-company step order matters (can't check employee_count-based
     disqualifiers before employee_count is known).
 
+    A company that already has a Qualification row for this campaign
+    already cleared this gate once -- re-running the employee_count/
+    hard/text/rollup checks on it every subsequent run serves no
+    purpose and is actively harmful: confirmed live 2026-08-20, three
+    real Tier A/B/C companies (with employee_count that had genuinely
+    never resolved, e.g. Universal Court Reporting) got knocked from a
+    valid tier to MANUAL_REVIEW on every single re-run because THIS
+    unrelated re-check kept failing, even though their actual
+    qualification was untouched and correct. Skipping already-qualified
+    companies here is what makes repeat runs of this pipeline safe to
+    fire off without babysitting -- a standalone system can't have
+    already-correct answers flapping back to "needs review" just from
+    running again.
+
     job_openings enrichment is deliberately NOT here -- see
     enrich_job_openings_for_company, called only for Tier A/B companies."""
     passed: list[Company] = []
     rejected: list[RejectedCompany] = []
     rejected_ids: set[int] = set()
+
+    if campaign_key:
+        from backend.models.database import Qualification
+
+        already_qualified_ids = {
+            q.company_id
+            for q in session.query(Qualification.company_id).filter(
+                Qualification.campaign_id == campaign_key,
+                Qualification.company_id.in_([c.id for c in companies]),
+            )
+        }
+        if already_qualified_ids:
+            passed.extend(c for c in companies if c.id in already_qualified_ids)
+            companies = [c for c in companies if c.id not in already_qualified_ids]
 
     def reject(company: Company, reason: str, status: str = CompanyStatus.DISQUALIFIED.value) -> None:
         company.status = status
@@ -225,6 +254,10 @@ def filter_companies(
         text_reason = check_text_based_disqualifiers(company.description)
         if text_reason:
             reject(company, text_reason)
+            continue
+        rollup_reason = check_rollup_subsidiary_name(company.company_name)
+        if rollup_reason:
+            reject(company, rollup_reason)
             continue
         company.status = CompanyStatus.FIRMOGRAPHICALLY_FILTERED.value
         passed.append(company)

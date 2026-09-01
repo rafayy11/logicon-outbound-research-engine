@@ -44,6 +44,7 @@ from backend.models.database import (
     init_db,
 )
 from backend.models.schemas import CampaignRunStats, CompanyStatus, RawCompany, RejectedCompany
+from backend.providers.clay.accounts import active_account
 from backend.providers.clay.client import ClayClient
 from backend.providers.clay.routines import ClayRoutines
 from backend.providers.clay.search import ClaySearch
@@ -151,7 +152,7 @@ def _ensure_campaign_row(session: Session, campaign: CampaignConfig) -> Campaign
     return row
 
 
-def _current_ready_count(session: Session, campaign_key: str, coverage_field: str) -> int:
+def _current_ready_count(session: Session, campaign_key: str, coverage_field: str, tiers: tuple[str, ...] = ("A", "B")) -> int:
     """Must mirror exports/csv.py's personalization_gap_reason() exactly,
     or this undercounts remaining work: confirmed live, without the
     coverage_field check this returned 10 (Tier A/B + verified + email
@@ -174,7 +175,7 @@ def _current_ready_count(session: Session, campaign_key: str, coverage_field: st
         )
         .filter(
             Qualification.campaign_id == campaign_key,
-            Qualification.tier.in_(["A", "B"]),
+            Qualification.tier.in_(list(tiers)),
             DecisionMakerStatusRecord.campaign_id == campaign_key,
             DecisionMakerStatusRecord.employment_verified == True,  # noqa: E712
             DecisionMakerStatusRecord.email_status == "FOUND",
@@ -184,40 +185,39 @@ def _current_ready_count(session: Session, campaign_key: str, coverage_field: st
     )
 
 
-def _process_qualified_company(
+def _qualify_company(
     session: Session,
     company: Company,
     campaign: CampaignConfig,
     clay_routines: ClayRoutines,
-    clay_search: ClaySearch,
     budget: CreditBudget,
     stats: CampaignRunStats,
     rejected: list[RejectedCompany],
     run_row: CampaignRun,
-    research_run_id: str,
     people_results: Optional[list],
-) -> None:
-    """Coordinators -> tier -> (Tier A/B only) job openings + research ->
-    decision maker -> employment -> email, for one company that already
-    passed the firmographic filter. Raises on unexpected errors -- the
-    caller wraps this per company so one failure can't take down the
-    whole run.
+) -> Optional[Qualification]:
+    """Stage 1 (the cheap, ICP-fit-determining stage): coordinator search
+    (a free Clay *search* call, not enrichment credit) -> tier -> (Tier
+    A/B only) job openings. Returns the Qualification row if the company
+    reached Tier A or B (i.e. is worth spending stage-2 enrichment credit
+    on), None otherwise -- disqualified, Tier C (parked), or a provider
+    error sent to manual review.
+
+    Spends NOTHING from Clay's scarce enrichment-credit pool for the
+    ~86-89% of companies that don't reach Tier A/B on this dataset --
+    coordinator search is billed
+    against Clay's separate, effectively-unlimited search quota
+    (confirmed live 2026-08-19: 1,000,000/year, ~7k used). This is what
+    makes it safe to run this stage across every collected company
+    without worrying about the enrichment budget at all; _enrich_company
+    (job openings, research, decision maker, email) is the stage that
+    actually spends real credit, and only ever runs on what this
+    function returns.
 
     people_results is pre-fetched by the caller (fetch_people_at_company,
     run concurrently across the whole batch) -- only the DB-writing half
     (persist_coordinators) happens here, since SQLAlchemy sessions aren't
-    safe to write to from multiple threads.
-
-    The 7-field research stage is 7 AI-powered Claygent calls per
-    company (now one batched call) -- confirmed live to be the dominant
-    Clay-credit cost in a real run (88% of companies that got the full
-    research treatment turned out to have zero qualified coordinators
-    and were disqualified anyway). Coordinator discovery runs FIRST so a
-    company that was never going to qualify is screened out before any
-    research credit is spent on it; job_openings enrichment is deferred
-    to this same gate for the same reason (see
-    enrich_job_openings_for_company), and Tier C (parked, never sequenced
-    this run) also skips both -- it isn't going to be exported regardless."""
+    safe to write to from multiple threads."""
     stats.coordinator_candidates += 1
 
     existing_qualification = (
@@ -235,9 +235,22 @@ def _process_qualified_company(
         # CompanyStatus.EXPORTED is defined but never actually set
         # anywhere, so nothing ever marked a qualified company "done" and
         # every re-run was re-searching and re-spending on it).
+        #
+        # Also corrects a stale company.status: a company can have a
+        # perfectly valid Qualification from an earlier run but still
+        # show status=MANUAL_REVIEW because a LATER, unrelated step
+        # (e.g. a research-field timeout) overwrote it -- confirmed
+        # live, 26 of 41 "manual review" companies already had a real
+        # tiered Qualification and just never had their status corrected
+        # back, since this reuse path never used to touch company.status
+        # at all.
         qualification = existing_qualification
         if qualification.coordinator_count > 0:
             stats.coordinator_qualified += 1
+        company.status = (
+            CompanyStatus.DISQUALIFIED.value if qualification.tier is None else CompanyStatus.QUALIFIED.value
+        )
+        session.commit()
     else:
         if people_results is None:
             # Provider failure (rate limit, quota, network), not a genuine
@@ -266,7 +279,7 @@ def _process_qualified_company(
                     rejection_reason="Coordinator search failed (provider error) -- will retry on next run, not disqualified",
                 )
             )
-            return
+            return None
 
         persist_coordinators(session, company, campaign, people_results)
         budget.record("coordinator_search", 1)
@@ -292,7 +305,7 @@ def _process_qualified_company(
                 rejection_reason=qualification.disqualification_reason or "No qualified coordinators found",
             )
         )
-        return  # disqualified -- no coordinators, stop here -- no research spend
+        return None  # disqualified -- no coordinators, stop here -- no enrichment spend
 
     if qualification.tier not in ("A", "B"):
         rejected.append(
@@ -301,17 +314,50 @@ def _process_qualified_company(
                 domain=company.canonical_domain,
                 source=None,
                 rejection_stage="tiering",
-                rejection_reason=f"Tier C ({count} qualified coordinator(s)) -- parked, not sequenced",
+                rejection_reason=f"Tier C ({qualification.coordinator_count} qualified coordinator(s)) -- parked, not sequenced",
             )
         )
-        return  # Tier C stops here -- no research, no decision-maker/email spend
+        return None  # Tier C stops here -- no enrichment spend
 
+    # job_openings is grouped with stage 1 (qualify), not stage 2 -- per
+    # explicit direction, "worth it" is determined by employee_count +
+    # coordinator_search + job_openings together, all in the same early
+    # pass, before any of the expensive per-field research/decision-
+    # maker/email spend. Still gated on Tier A/B (not run for Tier C or
+    # disqualified companies) so this doesn't multiply spend across the
+    # whole firmographically-passed pool -- only ~11-14% of that pool
+    # ever reaches Tier A/B on this dataset.
     try:
         enrich_job_openings_for_company(session, company, campaign.key, clay_routines)
         budget.record("job_openings", 1)
     except Exception as exc:  # optional evidence -- never blocks qualification
         logger.warning("job_openings enrichment failed for %s: %s", company.company_name, exc)
 
+    return qualification  # Tier A/B -- worth spending enrichment credit on
+
+
+def _enrich_qualified_company(
+    session: Session,
+    company: Company,
+    campaign: CampaignConfig,
+    clay_routines: ClayRoutines,
+    clay_search: ClaySearch,
+    budget: CreditBudget,
+    stats: CampaignRunStats,
+    rejected: list[RejectedCompany],
+    run_row: CampaignRun,
+    research_run_id: str,
+) -> None:
+    """Stage 2 (the expensive stage): the 7-field research batch +
+    decision maker + employment verification + email -- only ever called
+    for a company _qualify_company already confirmed Tier A/B (job
+    openings already ran as part of that stage 1 call). This is
+    deliberately a separate function (not just a later part of the same
+    call) so it can be invoked on its own, in a later run, against
+    companies already sitting at Tier A/B in the database -- the --stage
+    enrich CLI mode does exactly that, skipping collection/firmographics/
+    coordinator-search/job-openings entirely and spending real
+    enrichment credit only on companies already confirmed worth it."""
     stats.research_candidates += 1
     research_company(session, company, campaign, clay_routines, run_row.id, research_run_id)
     stats.research_completed += 1
@@ -349,7 +395,58 @@ def _process_qualified_company(
         rejected.append(RejectedCompany(company=company.company_name, domain=company.canonical_domain, source=None, rejection_stage="email_discovery", rejection_reason="No usable work email found"))
 
 
-def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
+def _process_qualified_company(
+    session: Session,
+    company: Company,
+    campaign: CampaignConfig,
+    clay_routines: ClayRoutines,
+    clay_search: ClaySearch,
+    budget: CreditBudget,
+    stats: CampaignRunStats,
+    rejected: list[RejectedCompany],
+    run_row: CampaignRun,
+    research_run_id: str,
+    people_results: Optional[list],
+) -> None:
+    """--stage full: qualify then, only if Tier A/B, immediately enrich
+    in the same pass. Kept as one call for the default/simple path;
+    --stage qualify and --stage enrich call _qualify_company and
+    _enrich_qualified_company separately instead."""
+    qualification = _qualify_company(session, company, campaign, clay_routines, budget, stats, rejected, run_row, people_results)
+    if qualification is not None:
+        _enrich_qualified_company(session, company, campaign, clay_routines, clay_search, budget, stats, rejected, run_row, research_run_id)
+
+
+def run_pipeline(campaign: CampaignConfig, target: int, stage: str = "full", enrich_tiers: tuple[str, ...] = ("A", "B")) -> CampaignRunStats:
+    """stage:
+      "qualify" -- sources through coordinator search + tiering only.
+                   Spends nothing from Clay's scarce enrichment-credit
+                   pool (coordinator search bills against the separate,
+                   effectively-unlimited search quota). Use this to
+                   build/refresh the Tier A/B/C list against existing or
+                   newly-collected companies without committing any real
+                   credit.
+      "enrich"  -- skips collection/firmographics/coordinator-search
+                   entirely and runs job openings + research + decision
+                   maker + employment + email ONLY for companies already
+                   at a tier in `enrich_tiers` (default Tier A/B; pass
+                   ("A","B","C") to also spend on Tier C) in the database
+                   from a prior "qualify" (or "full") run. This is the
+                   stage that actually spends real enrichment credit --
+                   run it deliberately, once you've reviewed the
+                   qualify-stage results. Note this spends real credit
+                   REGARDLESS of whether Claygent finds an answer --
+                   there's no way to know in advance whether a Tier C
+                   company's research fields will come back NONE, so
+                   including Tier C is a real bet on hit rate, not free
+                   upside.
+      "full"    -- both, per company, in one pass (original behavior);
+                   enrich_tiers has no effect here, Tier C is always
+                   parked with no spend in this mode.
+    """
+    if stage not in ("qualify", "enrich", "full"):
+        raise ValueError(f"stage must be 'qualify', 'enrich', or 'full', got {stage!r}")
+
     init_db()
     session = get_session()
     _ensure_campaign_row(session, campaign)
@@ -359,12 +456,15 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
     session.add(run_row)
     session.commit()
 
-    api_key = os.environ.get("CLAY_API_KEY")
+    account = active_account()
+    api_key = account.api_key
     clay_client = ClayClient(api_key=api_key) if api_key else None
     clay_routines = ClayRoutines(clay_client) if clay_client else None
     clay_search = ClaySearch(clay_client) if clay_client else None
     if clay_client is None:
-        logger.error("CLAY_API_KEY not set -- cannot run Clay research/coordinator/decision-maker/email stages")
+        logger.error("No API key configured for Clay account %r -- cannot run Clay research/coordinator/decision-maker/email stages", account.name)
+    else:
+        logger.info("Using Clay account: %s", account.name)
 
     budget = CreditBudget.from_env()
     batcher = BatchController.from_env(target)
@@ -373,50 +473,82 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
 
     rejected: list[RejectedCompany] = []
 
-    # -- 1-4: sources, normalize, dedupe --------------------------------
-    raw_companies = collect_raw_companies(campaign)
-    stats.raw_companies = len(raw_companies)
-
-    companies = import_raw_companies(session, raw_companies)
-    stats.deduplicated = len(companies)
-
-    # -- 5: suppression check --------------------------------------------
-    surviving: list[Company] = []
-    for c in companies:
-        reason = suppression.check_company(c)
-        if reason:
-            stats.suppressed += 1
-            rejected.append(RejectedCompany(company=c.company_name, domain=c.canonical_domain, source=None, rejection_stage="suppression", rejection_reason=reason))
-        else:
-            surviving.append(c)
-    companies = surviving
-
-    # A company already DISQUALIFIED or EXPORTED in a prior run has a
-    # final, real-business-reason answer -- re-running it would just
-    # re-spend Clay credits to reach the same conclusion. MANUAL_REVIEW is
-    # NOT skipped here: that status means a provider call failed
-    # transiently last time (e.g. Clay's "unexpected error"), and it's
-    # exactly what should get a fresh attempt on the next run.
-    _TERMINAL_STATUSES = {CompanyStatus.DISQUALIFIED.value, CompanyStatus.EXPORTED.value}
-    already_decided = [c for c in companies if c.status in _TERMINAL_STATUSES]
-    if already_decided:
-        logger.info(
-            "Skipping %d compan(ies) already decided in a prior run: %s",
-            len(already_decided), [c.company_name for c in already_decided],
+    if stage == "enrich":
+        # Skip collection/firmographics/coordinator-search entirely --
+        # work only from companies already tiered in the database.
+        # "we have almost no credits, build a list with the existing
+        # one": this is exactly that -- zero new raw companies, zero new
+        # coordinator searches, spend only goes toward turning already-
+        # confirmed companies into real contacts + emails.
+        stats.raw_companies = 0
+        stats.deduplicated = 0
+        tiered = (
+            session.query(Company)
+            .join(Qualification, Qualification.company_id == Company.id)
+            .filter(Qualification.campaign_id == campaign.key, Qualification.tier.in_(list(enrich_tiers)))
+            .all()
         )
-    companies = [c for c in companies if c.status not in _TERMINAL_STATUSES]
+        logger.info("Enrich stage: %d Tier %s companies to process (from prior qualify runs)", len(tiered), "/".join(enrich_tiers))
+        if clay_client is not None:
+            for company in tiered:
+                if not budget.has_budget_for(len(campaign.research_fields) + 3):
+                    logger.warning("Clay budget insufficient to continue enrich stage (remaining %s) -- stopping", budget.remaining)
+                    break
+                try:
+                    _enrich_qualified_company(session, company, campaign, clay_routines, clay_search, budget, stats, rejected, run_row, research_run_id)
+                except Exception as exc:
+                    logger.exception("Unhandled error enriching %s -- logging and continuing", company.company_name)
+                    session.rollback()
+                    session.add(ProviderError(run_id=run_row.id, company_id=company.id, operation="enrich_qualified_company", provider="pipeline", error=str(exc), occurred_at=datetime.utcnow()))
+                    company.status = CompanyStatus.MANUAL_REVIEW.value
+                    session.commit()
+        companies = []  # nothing further to collect/filter below
 
-    # Order the queue so Clay spend concentrates on companies most likely
-    # to qualify: Clay-ICP-sourced + coordinator-shaped homepage language
-    # first, small-shop sources with no positive signal last. Both checks
-    # are free (source is already-known metadata; the pre-screen is a
-    # plain HTTP fetch, no Clay credit) and run once for the whole queue,
-    # not per-batch.
-    priority = _build_priority_map(session, companies, campaign)
-    companies.sort(key=lambda c: priority[c.id])
+    else:
+        # -- 1-4: sources, normalize, dedupe --------------------------------
+        raw_companies = collect_raw_companies(campaign)
+        stats.raw_companies = len(raw_companies)
 
-    # -- 6-14: batched cheap-first pipeline -------------------------------
-    if clay_client is not None:
+        companies = import_raw_companies(session, raw_companies)
+        stats.deduplicated = len(companies)
+
+        # -- 5: suppression check --------------------------------------------
+        surviving: list[Company] = []
+        for c in companies:
+            reason = suppression.check_company(c)
+            if reason:
+                stats.suppressed += 1
+                rejected.append(RejectedCompany(company=c.company_name, domain=c.canonical_domain, source=None, rejection_stage="suppression", rejection_reason=reason))
+            else:
+                surviving.append(c)
+        companies = surviving
+
+        # A company already DISQUALIFIED or EXPORTED in a prior run has a
+        # final, real-business-reason answer -- re-running it would just
+        # re-spend Clay credits to reach the same conclusion. MANUAL_REVIEW is
+        # NOT skipped here: that status means a provider call failed
+        # transiently last time (e.g. Clay's "unexpected error"), and it's
+        # exactly what should get a fresh attempt on the next run.
+        _TERMINAL_STATUSES = {CompanyStatus.DISQUALIFIED.value, CompanyStatus.EXPORTED.value}
+        already_decided = [c for c in companies if c.status in _TERMINAL_STATUSES]
+        if already_decided:
+            logger.info(
+                "Skipping %d compan(ies) already decided in a prior run: %s",
+                len(already_decided), [c.company_name for c in already_decided],
+            )
+        companies = [c for c in companies if c.status not in _TERMINAL_STATUSES]
+
+        # Order the queue so Clay spend concentrates on companies most likely
+        # to qualify: Clay-ICP-sourced + coordinator-shaped homepage language
+        # first, small-shop sources with no positive signal last. Both checks
+        # are free (source is already-known metadata; the pre-screen is a
+        # plain HTTP fetch, no Clay credit) and run once for the whole queue,
+        # not per-batch.
+        priority = _build_priority_map(session, companies, campaign)
+        companies.sort(key=lambda c: priority[c.id])
+
+    # -- 6-14: batched cheap-first pipeline (stage in "qualify"/"full" only) --
+    if stage != "enrich" and clay_client is not None:
         for batch in chunk(companies, batcher.batch_size):
             ready_so_far = _current_ready_count(session, campaign.key, campaign.coverage_field)
             if not batcher.should_launch_next_batch(ready_so_far):
@@ -431,7 +563,7 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
                 )
                 break
 
-            passed, batch_rejected = filter_companies(session, batch, clay_routines, run_row.id)
+            passed, batch_rejected = filter_companies(session, batch, clay_routines, run_row.id, campaign.key)
             rejected.extend(batch_rejected)
             stats.firmographic_pass += len(passed)
             budget.record("firmographic_enrichment", len(batch))
@@ -483,11 +615,17 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
 
             for company in passed:
                 try:
-                    _process_qualified_company(
-                        session, company, campaign, clay_routines, clay_search,
-                        budget, stats, rejected, run_row, research_run_id,
-                        people_results_by_company.get(company.id, []),
-                    )
+                    if stage == "qualify":
+                        _qualify_company(
+                            session, company, campaign, clay_routines, budget, stats, rejected, run_row,
+                            people_results_by_company.get(company.id, []),
+                        )
+                    else:  # stage == "full"
+                        _process_qualified_company(
+                            session, company, campaign, clay_routines, clay_search,
+                            budget, stats, rejected, run_row, research_run_id,
+                            people_results_by_company.get(company.id, []),
+                        )
                 except Exception as exc:
                     # Defense in depth: every Clay call already has its own
                     # error handling, but this catches anything else
@@ -510,7 +648,7 @@ def run_pipeline(campaign: CampaignConfig, target: int) -> CampaignRunStats:
                     )
                     company.status = CompanyStatus.MANUAL_REVIEW.value
                     session.commit()
-    else:
+    elif clay_client is None:
         stats.firmographic_pass = 0
 
     # -- 15: exports --------------------------------------------------------

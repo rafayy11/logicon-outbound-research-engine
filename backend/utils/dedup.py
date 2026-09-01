@@ -56,6 +56,7 @@ def resolve_company(session: Session, raw: RawCompany) -> Company:
             city=raw.city,
             state=raw.state,
             country=raw.country,
+            description=raw.description,
             identity_confidence=confidence.value,
             identity_key=ikey,
             status=CompanyStatus.DISCOVERED.value,
@@ -75,6 +76,7 @@ def resolve_company(session: Session, raw: RawCompany) -> Company:
         company.address = company.address or raw.address
         company.city = company.city or raw.city
         company.state = company.state or raw.state
+        company.description = company.description or raw.description
 
     session.add(
         CompanySource(

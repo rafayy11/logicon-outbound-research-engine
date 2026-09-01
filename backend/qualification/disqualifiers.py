@@ -53,6 +53,35 @@ def _match_any(patterns: list[str], text: str) -> Optional[str]:
     return None
 
 
+_ROLLUP_SUBSIDIARY_NAME_PATTERN = re.compile(r"[,:]\s*[Aa]\s+[A-Z][\w&]*(?:\s+[A-Z][\w&]*)*\s+Company\b")
+
+
+def check_rollup_subsidiary_name(company_name: str) -> Optional[str]:
+    """The playbook's PE-owned/mandated-stack rule was only ever checked
+    against company.description -- but that field has never actually
+    been populated by any source (RawCompany has no description field
+    at all), so the rule could never fire. Confirmed live 2026-08-19:
+    4 companies in the database are explicitly branded as an acquired
+    subsidiary right in their own name ("Atkinson-Baker, a Veritext
+    Company", "Discovery Resource, a Datavant Company", "Imber Court
+    Reporters, a Lexitas Company", "Schmitt Reporting & Video, a
+    Veritext Company") -- one was sitting in ready.csv. This matches the
+    exact exclusion the user's own curated spreadsheet already applied
+    to a similar case (TriStar Court Reporting, excluded for "description
+    explicitly reads 'A Veritext Company'").
+
+    Deliberately does NOT flag the parent/consolidator itself (Lexitas,
+    Veritext, Datavant) -- the rule targets subsidiaries whose tooling
+    is presumably dictated by the parent, not the parent making its own
+    buying decisions."""
+    if not company_name:
+        return None
+    match = _ROLLUP_SUBSIDIARY_NAME_PATTERN.search(company_name)
+    if match:
+        return f"Name identifies this as an acquired roll-up subsidiary (evidence: '{match.group(0).strip(', ')}')"
+    return None
+
+
 def check_text_based_disqualifiers(text: Optional[str]) -> Optional[str]:
     """Scans real enrichment/research text (company description, news,
     software_mentioned evidence) for explicit disqualifying language.

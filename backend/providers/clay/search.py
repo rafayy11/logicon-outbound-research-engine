@@ -38,6 +38,27 @@ def _quote(s: str) -> str:
     return '"' + s.replace('"', '\\"') + '"'
 
 
+# Court-reporting/legal-video credential suffixes that show up appended
+# to a person's name in Clay's underlying data (e.g. "Renee CRR",
+# "Natalia CLVS") -- confirmed live 2026-08-21: this got parsed as a
+# literal last name, corrupting decision-maker/email lookups (which
+# search on the real name). Stripped as a trailing token, never guessed
+# beyond this fixed, real, industry-standard credential list.
+_CREDENTIAL_SUFFIXES = {
+    "CRR", "RPR", "RMR", "CSR", "CLVS", "CCR", "FCRR", "CRC", "FPR",
+    "CBC", "CVR-CLR", "RDR", "CRI", "CPE", "CLR",
+}
+
+
+def _strip_credential_suffix(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    parts = name.split()
+    while parts and parts[-1].upper().rstrip(",.") in _CREDENTIAL_SUFFIXES:
+        parts.pop()
+    return " ".join(parts) or None
+
+
 def build_people_at_company_query(domain: str, title_candidates: list[str]) -> str:
     titles = ", ".join(_quote(t) for t in title_candidates)
     return (
@@ -53,6 +74,7 @@ def _parse_person(raw: dict[str, Any], searched_domain: str) -> ClayPersonResult
         parts = str(raw["name"]).split(" ", 1)
         first_name = parts[0]
         last_name = parts[1] if len(parts) > 1 else None
+    last_name = _strip_credential_suffix(last_name)
 
     experiences = raw.get("matched_experiences") or []
     top_experience = experiences[0] if experiences else {}

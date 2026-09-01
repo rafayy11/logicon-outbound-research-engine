@@ -113,6 +113,7 @@ class RawCompany(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     country: str = "US"
+    description: Optional[str] = None
     source: str
     source_url: Optional[str] = None
     source_identifier: Optional[str] = None
